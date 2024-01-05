@@ -1,0 +1,245 @@
+--- nova/objects/image_meta.py
++++ nova.new/objects/image_meta.py
+@@ -274,6 +274,10 @@
+         # maximum number of CPU cores per socket
+         'hw_cpu_max_cores': fields.IntegerField(),
+ 
++        'hw_cpu_name': fields.StringField(),
++        'hw_cpu_vendor': fields.StringField(),
++        'hw_cpu_model_id': fields.StringField(),
++
+         # maximum number of CPU sockets
+         'hw_cpu_max_sockets': fields.IntegerField(),
+ 
+--- nova/objects/virt_cpu_topology.py
++++ nova.new/objects/virt_cpu_topology.py
+@@ -23,6 +23,9 @@
+         'sockets': fields.IntegerField(nullable=True, default=1),
+         'cores': fields.IntegerField(nullable=True, default=1),
+         'threads': fields.IntegerField(nullable=True, default=1),
++        'name': fields.StringField(nullable=True, default=None),
++        'vendor': fields.StringField(nullable=True, default=None),
++        'model_id': fields.StringField(nullable=True, default=None),
+         }
+ 
+     # NOTE(jaypipes): for backward compatibility, the virt CPU topology
+@@ -31,11 +34,17 @@
+     def from_dict(cls, data):
+         return cls(sockets=data.get('sockets'),
+                    cores=data.get('cores'),
+-                   threads=data.get('threads'))
++                   threads=data.get('threads'),
++                   name=data.get('name'),
++                   vendor=data.get('vendor'),
++                   model_id=data.get('model_id'))
+ 
+     def to_dict(self):
+         return {
+             'sockets': self.sockets,
+             'cores': self.cores,
+-            'threads': self.threads
++            'threads': self.threads,
++            'name': self.name,
++            'vendor': self.vendor,
++            'model_id': self.model_id
+         }
+--- nova/virt/hardware.py
++++ nova.new/virt/hardware.py
+@@ -323,6 +323,13 @@
+         'cpu_max_cores', flavor, image_meta, 0)
+     flavor_max_threads, image_max_threads = _get_flavor_image_meta(
+         'cpu_max_threads', flavor, image_meta, 0)
++    flavor_cpuname, image_threads = _get_flavor_image_meta(
++        'cpu_name', flavor, image_meta, 0)
++    flavor_cpuvendor, image_threads = _get_flavor_image_meta(
++        'cpu_vendor', flavor, image_meta, 0)
++    flavor_cpumodelid, image_threads = _get_flavor_image_meta(
++        'cpu_model_id', flavor, image_meta, 0)
++
+     # image metadata is already of the correct type
+     try:
+         flavor_max_sockets = int(flavor_max_sockets)
+@@ -422,13 +429,15 @@
+                "maxcores": max_cores, "maxthreads": max_threads})
+ 
+     return (objects.VirtCPUTopology(sockets=sockets, cores=cores,
+-                                    threads=threads),
++                                    threads=threads, name=flavor_cpuname,
++                                    vendor=flavor_cpuvendor, model_id=flavor_cpumodelid),
+             objects.VirtCPUTopology(sockets=max_sockets, cores=max_cores,
+-                                    threads=max_threads))
++                                    threads=max_threads, name=flavor_cpuname,
++                                    vendor=flavor_cpuvendor, model_id=flavor_cpumodelid))
+ 
+ 
+-def _get_possible_cpu_topologies(vcpus, maxtopology,
+-                                 allow_threads):
++def _get_possible_cpu_topologies(flavor, maxtopology,
++                                 allow_threads, image_meta):
+     """Get a list of possible topologies for a vCPU count.
+ 
+     Given a total desired vCPU count and constraints on the maximum
+@@ -448,6 +457,7 @@
+     """
+     # Clamp limits to number of vcpus to prevent
+     # iterating over insanely large list
++    vcpus = flavor.vcpus
+     maxsockets = min(vcpus, maxtopology.sockets)
+     maxcores = min(vcpus, maxtopology.cores)
+     maxthreads = min(vcpus, maxtopology.threads)
+@@ -467,6 +477,13 @@
+     # count and then only iterate over its factors, but
+     # that's overkill right now
+     possible = []
++    flavor_cpuname, image_threads = _get_flavor_image_meta(
++        'cpu_name', flavor, image_meta, 0)
++    flavor_cpuvendor, image_threads = _get_flavor_image_meta(
++        'cpu_vendor', flavor, image_meta, 0)
++    flavor_cpumodelid, image_threads = _get_flavor_image_meta(
++        'cpu_model_id', flavor, image_meta, 0)
++
+     for s in range(1, maxsockets + 1):
+         for c in range(1, maxcores + 1):
+             for t in range(1, maxthreads + 1):
+@@ -475,7 +492,10 @@
+                 possible.append(
+                     objects.VirtCPUTopology(sockets=s,
+                                             cores=c,
+-                                            threads=t))
++                                            threads=t,
++                                            name=flavor_cpuname,
++                                            vendor=flavor_cpuvendor,
++                                            model_id=flavor_cpumodelid))
+ 
+     # We want to
+     #  - Minimize threads (ie larger sockets * cores is best)
+@@ -597,9 +617,10 @@
+     LOG.debug("Topology preferred %(preferred)s, maximum %(maximum)s",
+               {"preferred": preferred, "maximum": maximum})
+ 
+-    possible = _get_possible_cpu_topologies(flavor.vcpus,
++    possible = _get_possible_cpu_topologies(flavor,
+                                             maximum,
+-                                            allow_threads)
++                                            allow_threads,
++                                            image_meta)
+     LOG.debug("Possible topologies %s", possible)
+ 
+     if numa_topology:
+--- nova/virt/libvirt/config.py
++++ nova.new/virt/libvirt/config.py
+@@ -39,8 +39,10 @@
+ 
+ # Namespace to use for Nova specific metadata items in XML
+ NOVA_NS = "http://openstack.org/xmlns/libvirt/nova/1.0"
++QEMU_NS = "http://libvirt.org/schemas/domain/qemu/1.0"
+ 
+ 
++
+ class LibvirtConfigObject(object):
+ 
+     def __init__(self, **kwargs):
+@@ -849,6 +851,7 @@
+         self.mode = None
+         self.match = "exact"
+         self.numa = None
++        self.vendor_id = None
+ 
+     def parse_dom(self, xmldoc):
+         super(LibvirtConfigGuestCPU, self).parse_dom(xmldoc)
+@@ -863,9 +866,10 @@
+     def format_dom(self):
+         cpu = super(LibvirtConfigGuestCPU, self).format_dom()
+ 
+-        if self.mode:
+-            cpu.set("mode", self.mode)
+-        cpu.set("match", self.match)
++        if self.vendor_id is None:
++            if self.mode:
++                cpu.set("mode", self.mode)
++            cpu.set("match", self.match)
+         if self.numa is not None:
+             cpu.append(self.numa.format_dom())
+ 
+@@ -2684,6 +2688,7 @@
+         self.idmaps = []
+         self.perf_events = []
+         self.launch_security = None
++        self.qemucommand = None
+ 
+     def _format_basic_props(self, root):
+         root.append(self._text_node("uuid", self.uuid))
+@@ -2705,6 +2710,8 @@
+             root.append(vcpu)
+         else:
+             root.append(self._text_node("vcpu", self.vcpus))
++        if self.qemucommand is not None:
++            root.append(self.qemucommand.format_dom())
+ 
+         if len(self.metadata) > 0:
+             metadata = etree.Element("metadata")
+@@ -3341,3 +3348,26 @@
+                 for sub in c.getchildren():
+                     if sub.tag == "size":
+                         self.target_size = sub.text
++
++
++class LibvirtConfigQemuCommand(LibvirtConfigObject):
++    def __init__(self):
++        super(LibvirtConfigQemuCommand, self).__init__(root_name="commandline",
++                                                       ns_prefix="qemu",
++                                                       ns_uri=QEMU_NS)
++        self.vendor = None;
++        self.model_id = None;
++        self.cpu_name = None;
++
++    def format_dom(self):
++        qemucommand = super(LibvirtConfigQemuCommand, self).format_dom()
++
++        if self.cpu_name:
++            arg2 = self._new_node("arg")
++            arg2.set("value", "-cpu")
++            qemucommand.append(arg2)
++            arg1 = self._new_node("arg", value=self.cpu_name + ",vendor=" +
++                                               self.vendor + ",model_id=" + self.model_id)
++            qemucommand.append(arg1)
++
++        return qemucommand
+--- nova/virt/libvirt/driver.py
++++ nova.new/virt/libvirt/driver.py
+@@ -4637,6 +4637,7 @@
+         cpu.cores = topology.cores
+         cpu.threads = topology.threads
+         cpu.numa = guest_cpu_numa_config
++        cpu.vendor_id = topology.vendor
+ 
+         return cpu
+ 
+@@ -5970,6 +5971,18 @@
+         usbhost.index = 0
+         guest.add_device(usbhost)
+ 
++    def _get_qemu_command(self, flavor):
++        qemu_command = vconfig.LibvirtConfigQemuCommand()
++        flvcpuname = flavor.extra_specs.get("hw:cpu_name", None)
++        flvcpuvendor = flavor.extra_specs.get("hw:cpu_vendor", None)
++        flvcpumodelid = flavor.extra_specs.get("hw:cpu_model_id", None)
++
++        qemu_command.vendor = flvcpuvendor
++        qemu_command.model_id = flvcpumodelid
++        qemu_command.cpu_name = flvcpuname
++
++        return qemu_command
++
+     def _get_guest_config(self, instance, network_info, image_meta,
+                           disk_info, rescue=None, block_device_info=None,
+                           context=None, mdevs=None, accel_info=None):
+@@ -6019,6 +6032,8 @@
+         guest.cpu = self._get_guest_cpu_config(
+             flavor, image_meta, guest_numa_config.numaconfig,
+             instance.numa_topology)
++
++        guest.qemucommand = self._get_qemu_command(flavor)
+ 
+         # Notes(yjiang5): we always sync the instance's vcpu model with
+         # the corresponding config file.
